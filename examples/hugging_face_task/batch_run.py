@@ -16,12 +16,10 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from queue import Queue
 
 DOCKER_DIR = Path(os.environ.get("DOCKER_IMAGES_DIR", "/mnt/nvme/images/docker/"))
 SCRIPT_DIR = Path(__file__).parent
 OUTPUT_DIR = SCRIPT_DIR / "output"
-BASE_PORT = int(os.environ.get("BASE_PORT", "8100"))
 
 
 def log(msg):
@@ -51,30 +49,29 @@ def preload_images():
     log("Done loading images.")
 
 
-def run_task(slug, port_queue):
-    port = port_queue.get()
-    try:
-        out = OUTPUT_DIR / slug
-        out.mkdir(parents=True, exist_ok=True)
-        env = os.environ.copy()
-        env["CONTAINER_PORT"] = str(port)
-        env["ENV_URL"] = f"http://localhost:{port}"
-        env["SKIP_DOCKER_LOAD"] = "1"
-        env["DOCKER_IMAGES_DIR"] = DOCKER_DIR
-        start = time.time()
+def run_task(slug, max_retries=3):
+    out = OUTPUT_DIR / slug
+    out.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["SKIP_DOCKER_LOAD"] = "1"
+    env["DOCKER_IMAGES_DIR"] = str(DOCKER_DIR)
+    start = time.time()
+    for attempt in range(1, max_retries + 1):
         with open(out / "run.log", "w") as lf:
             rc = subprocess.run(
                 [sys.executable, str(SCRIPT_DIR / "main.py"), slug],
                 env=env, stdout=lf, stderr=subprocess.STDOUT, timeout=1800,
             ).returncode
-        elapsed = round(time.time() - start, 1)
-        score = None
-        grades = out / "grades.json"
-        if grades.exists():
-            score = json.loads(grades.read_text()).get("scoring_results", {}).get("final_score")
-        return slug, rc, score, elapsed
-    finally:
-        port_queue.put(port)
+        if rc == 0 or attempt == max_retries:
+            break
+        log(f"Retrying {slug} (attempt {attempt + 1}/{max_retries})")
+        time.sleep(2 * attempt)
+    elapsed = round(time.time() - start, 1)
+    score = None
+    grades = out / "grades.json"
+    if grades.exists():
+        score = json.loads(grades.read_text()).get("scoring_results", {}).get("final_score")
+    return slug, rc, score, elapsed
 
 
 def main():
@@ -100,15 +97,10 @@ def main():
     else:
         log("Skipping image preload (already loaded)")
 
-    # Port pool: each worker gets a unique port, returned when done
-    port_queue = Queue()
-    for i in range(args.workers):
-        port_queue.put(BASE_PORT + i)
-
     done, failed, scores = 0, 0, []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(run_task, slug, port_queue): slug
+            pool.submit(run_task, slug): slug
             for slug in tasks
         }
         for f in as_completed(futures):

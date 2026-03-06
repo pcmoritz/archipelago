@@ -25,8 +25,6 @@ AGENTS_DIR = Path(os.environ.get("AGENTS_DIR", ARCHIPELAGO_DIR / "agents"))
 GRADING_DIR = Path(os.environ.get("GRADING_DIR", ARCHIPELAGO_DIR / "grading"))
 
 DOCKER_IMAGES_DIR = Path(os.environ.get("DOCKER_IMAGES_DIR", "/home/ubuntu/docker"))
-CONTAINER_PORT = int(os.environ.get("CONTAINER_PORT", "8000"))
-ENV_URL = os.environ.get("ENV_URL", f"http://localhost:{CONTAINER_PORT}")
 
 DEFAULT_TASK_SLUG = "world221-tr-01-9ba58a61"
 
@@ -104,8 +102,21 @@ def load_docker_image(world_dir: Path) -> str:
     sys.exit(1)
 
 
-def start_container(image_ref: str, task_slug: str, container_name: str, env_file: Path | None):
-    """Start the pre-built docker container."""
+def get_container_ip(container_name: str) -> str:
+    """Get the container's IP address on the Docker bridge network."""
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}", container_name],
+        capture_output=True, text=True,
+    )
+    ip = result.stdout.strip()
+    if result.returncode != 0 or not ip:
+        log("ERROR: Could not get container IP")
+        sys.exit(1)
+    return ip
+
+
+def start_container(image_ref: str, task_slug: str, container_name: str, env_file: Path | None) -> str:
+    """Start the pre-built docker container. Returns the environment base URL."""
     import httpx
 
     subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
@@ -113,7 +124,6 @@ def start_container(image_ref: str, task_slug: str, container_name: str, env_fil
     cmd = [
         "docker", "run", "-d", "--rm",
         "--name", container_name,
-        "-p", f"{CONTAINER_PORT}:8000",
     ]
     if env_file and env_file.exists():
         cmd.extend(["--env-file", str(env_file)])
@@ -125,11 +135,22 @@ def start_container(image_ref: str, task_slug: str, container_name: str, env_fil
         log(f"ERROR: Failed to start container: {result.stderr}")
         sys.exit(1)
 
+    env_url = f"http://{get_container_ip(container_name)}:8000"
+
     log("Waiting for health...")
     start = time.time()
     while time.time() - start < 300:
+        # Fail fast if the container has exited (--rm removes it)
+        probe = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+            capture_output=True, text=True,
+        )
+        if probe.returncode != 0:
+            log("ERROR: Container exited (already removed by --rm)")
+            log("ERROR: Environment failed to start")
+            sys.exit(1)
         try:
-            if httpx.get(f"{ENV_URL}/health", timeout=5).status_code == 200:
+            if httpx.get(f"{env_url}/health", timeout=5).status_code == 200:
                 break
         except httpx.RequestError:
             pass
@@ -150,6 +171,7 @@ def start_container(image_ref: str, task_slug: str, container_name: str, env_fil
         time.sleep(1)
 
     log("Environment ready")
+    return env_url
 
 
 def tar_gz_to_zip(tar_gz_path: Path) -> Path:
@@ -203,11 +225,11 @@ def main():
     env_file = world_dir / ".env"
 
     try:
-        start_container(image_ref, task_slug, container_name, env_file)
+        env_url = start_container(image_ref, task_slug, container_name, env_file)
 
         # Capture initial snapshot
         log("Capturing initial snapshot...")
-        initial_zip = snapshot(ENV_URL, output_dir / "initial_snapshot.tar.gz")
+        initial_zip = snapshot(env_url, output_dir / "initial_snapshot.tar.gz")
 
         # Load configs from runner_configs
         with open(config_dir / "orchestrator_config.json") as f:
@@ -221,7 +243,7 @@ def main():
             "uv", "run", "python", "-m", "runner.main",
             "--trajectory-id", trajectory_id,
             "--initial-messages", str(config_dir / "initial_messages.json"),
-            "--mcp-gateway-url", f"{ENV_URL}/mcp/",
+            "--mcp-gateway-url", f"{env_url}/mcp/",
             "--agent-config", str(config_dir / "agent_config.json"),
             "--orchestrator-model", orchestrator_model,
             "--output", str(trajectory_file),
@@ -246,7 +268,7 @@ def main():
 
         # Capture final snapshot
         log("Saving final snapshot...")
-        final_zip = snapshot(ENV_URL, output_dir / "final_snapshot.tar.gz")
+        final_zip = snapshot(env_url, output_dir / "final_snapshot.tar.gz")
         log(f"Saved: {final_zip}")
 
         # Run grading if agent completed
