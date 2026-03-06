@@ -3,7 +3,7 @@
 Batch run all tasks with parallel workers.
 
 Usage:
-    uv run python batch_run.py                    # 16 workers
+    uv run python batch_run.py                    # 32 workers
     uv run python batch_run.py --workers 8
     uv run python batch_run.py --resume           # skip done tasks
     ORCHESTRATOR_MODEL=gemini/gemini-3-pro-preview uv run python batch_run.py
@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from queue import Queue
 
-DOCKER_DIR = Path(os.environ.get("DOCKER_IMAGES_DIR", "/home/ubuntu/docker"))
+DOCKER_DIR = Path(os.environ.get("DOCKER_IMAGES_DIR", "/mnt/nvme/images/docker/"))
 SCRIPT_DIR = Path(__file__).parent
 OUTPUT_DIR = SCRIPT_DIR / "output"
 BASE_PORT = int(os.environ.get("BASE_PORT", "8100"))
@@ -60,6 +60,7 @@ def run_task(slug, port_queue):
         env["CONTAINER_PORT"] = str(port)
         env["ENV_URL"] = f"http://localhost:{port}"
         env["SKIP_DOCKER_LOAD"] = "1"
+        env["DOCKER_IMAGES_DIR"] = DOCKER_DIR
         start = time.time()
         with open(out / "run.log", "w") as lf:
             rc = subprocess.run(
@@ -79,7 +80,7 @@ def run_task(slug, port_queue):
 def main():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--workers", type=int, default=16)
+    p.add_argument("--workers", type=int, default=32)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--skip-preload", action="store_true")
     args = p.parse_args()
