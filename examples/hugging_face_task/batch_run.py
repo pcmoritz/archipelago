@@ -3,7 +3,7 @@
 Batch run all tasks with parallel workers.
 
 Usage:
-    uv run python batch_run.py                    # 32 workers
+    uv run python batch_run.py                    # 64 workers
     uv run python batch_run.py --workers 8
     uv run python batch_run.py --resume           # skip done tasks
     ORCHESTRATOR_MODEL=gemini/gemini-3-pro-preview uv run python batch_run.py
@@ -77,7 +77,7 @@ def run_task(slug, max_retries=3):
 def main():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--workers", type=int, default=32)
+    p.add_argument("--workers", type=int, default=64)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--skip-preload", action="store_true")
     args = p.parse_args()

@@ -127,7 +127,16 @@ def start_container(image_ref: str, task_slug: str, container_name: str, env_fil
     ]
     if env_file and env_file.exists():
         cmd.extend(["--env-file", str(env_file)])
-    cmd.extend([image_ref, "/app/tools/start.sh", task_slug])
+    cmd.extend([
+        image_ref,
+        "bash", "-c",
+        "sed -i \""
+        "s/TERRAPIN_OFFLINE='0'/TERRAPIN_OFFLINE='1'/;"
+        "s/FMP_OFFLINE_MODE='false'/FMP_OFFLINE_MODE='true'/;"
+        "s/EDGAR_OFFLINE_MODE='false'/EDGAR_OFFLINE_MODE='true'/;"
+        "\" /app/tools/start.sh && exec /app/tools/start.sh \"$@\"",
+        "--", task_slug,
+    ])
 
     log(f"Starting container for task {task_slug}...")
     result = subprocess.run(cmd, capture_output=True, text=True)
