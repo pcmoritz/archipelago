@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Run a task from the mercor/apex-agents HuggingFace dataset.
+Run a task using a pre-built Docker image from /home/ubuntu/docker/.
 
 Usage:
-    ./run.sh              # Run task index 0
-    ./run.sh 42           # Run task index 42
-    ./run.sh task_abc123  # Run task by ID
+    ./main.py                                           # Use default task slug
+    ./main.py world221-tr-01-9ba58a61                   # Run by task slug
+    ./main.py /home/ubuntu/docker/investment-banking-world-221--(world_f83f49b3776b4b5e870c36091f7e2b0b)  # Run by world dir (first task)
 """
 
-import io
 import json
 import os
-import shutil
+import re
 import subprocess
 import sys
 import tarfile
@@ -20,73 +19,137 @@ import uuid
 import zipfile
 from pathlib import Path
 
-import httpx
-from huggingface_hub import hf_hub_download
-
 EXAMPLE_DIR = Path(os.environ.get("EXAMPLE_DIR", Path(__file__).parent))
 ARCHIPELAGO_DIR = Path(os.environ.get("ARCHIPELAGO_DIR", EXAMPLE_DIR.parent.parent))
-ENVIRONMENT_DIR = Path(
-    os.environ.get("ENVIRONMENT_DIR", ARCHIPELAGO_DIR / "environment")
-)
 AGENTS_DIR = Path(os.environ.get("AGENTS_DIR", ARCHIPELAGO_DIR / "agents"))
 GRADING_DIR = Path(os.environ.get("GRADING_DIR", ARCHIPELAGO_DIR / "grading"))
 
-ENV_URL = os.environ.get("ENV_URL", "http://localhost:8080")
-HF_DATASET = "mercor/apex-agents"
+DOCKER_IMAGES_DIR = Path(os.environ.get("DOCKER_IMAGES_DIR", "/home/ubuntu/docker"))
+CONTAINER_PORT = int(os.environ.get("CONTAINER_PORT", "8000"))
+ENV_URL = os.environ.get("ENV_URL", f"http://localhost:{CONTAINER_PORT}")
 
-# Default task: Investment Banking World 221 - BBDC/TVPG accretion/dilution sensitivity analysis
-DEFAULT_TASK = "task_9ba58a6197114140877a1df1754d2993"
+DEFAULT_TASK_SLUG = "world221-tr-01-9ba58a61"
 
 
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def wait_for_health(url: str, timeout: int = 120) -> bool:
-    """Wait for environment to be healthy."""
+def find_world_and_slug(selector: str) -> tuple[Path, str]:
+    """Resolve selector to (world_dir, task_slug).
+
+    Selector can be:
+      - A task slug like "world221-tr-01-9ba58a61"
+      - A path to a world directory
+    """
+    # If it's a directory path, use first task
+    if os.path.isdir(selector):
+        world_dir = Path(selector)
+        slugs = [f.stem for f in sorted((world_dir / "tasks").glob("*.json"))]
+        if not slugs:
+            log(f"ERROR: No tasks found in {world_dir}/tasks/")
+            sys.exit(1)
+        return world_dir, slugs[0]
+
+    # Otherwise treat as task slug — search all world dirs
+    task_slug = selector
+    for entry in sorted(DOCKER_IMAGES_DIR.iterdir()):
+        if not entry.is_dir():
+            continue
+        config_dir = entry / "runner_configs" / task_slug
+        if config_dir.is_dir():
+            return entry, task_slug
+
+    log(f"ERROR: Task slug '{task_slug}' not found in any world under {DOCKER_IMAGES_DIR}")
+    sys.exit(1)
+
+
+def load_docker_image(world_dir: Path) -> str:
+    """Load image.tar and return the image reference.
+
+    If SKIP_DOCKER_LOAD=1 is set (e.g. by batch_run.py after pre-loading),
+    just read the tag from image.tar metadata without loading again.
+    """
+    image_tar = world_dir / "image.tar"
+
+    if os.environ.get("SKIP_DOCKER_LOAD") == "1":
+        # Image already loaded; extract the tag from the tar manifest
+        import tarfile as _tarfile
+        with _tarfile.open(str(image_tar), "r") as tf:
+            manifest = json.loads(tf.extractfile("manifest.json").read())
+        tags = manifest[0].get("RepoTags", [])
+        if tags:
+            log(f"Using pre-loaded image: {tags[0]}")
+            return tags[0]
+        # Fallback to image ID
+        config = manifest[0].get("Config", "")
+        image_id = config.replace(".json", "")
+        log(f"Using pre-loaded image ID: sha256:{image_id}")
+        return f"sha256:{image_id}"
+
+    log(f"Loading docker image from {image_tar}...")
+    result = subprocess.run(
+        ["docker", "load", "-i", str(image_tar)], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        log(f"ERROR: docker load failed: {result.stderr}")
+        sys.exit(1)
+
+    for line in result.stdout.strip().splitlines():
+        m = re.match(r"Loaded image(?:\s+ID)?: (.+)", line)
+        if m:
+            return m.group(1)
+
+    log(f"ERROR: Could not parse image ref from: {result.stdout}")
+    sys.exit(1)
+
+
+def start_container(image_ref: str, task_slug: str, container_name: str, env_file: Path | None):
+    """Start the pre-built docker container."""
+    import httpx
+
+    subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+
+    cmd = [
+        "docker", "run", "-d", "--rm",
+        "--name", container_name,
+        "-p", f"{CONTAINER_PORT}:8000",
+    ]
+    if env_file and env_file.exists():
+        cmd.extend(["--env-file", str(env_file)])
+    cmd.extend([image_ref, "/app/tools/start.sh", task_slug])
+
+    log(f"Starting container for task {task_slug}...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log(f"ERROR: Failed to start container: {result.stderr}")
+        sys.exit(1)
+
+    log("Waiting for health...")
     start = time.time()
-    while time.time() - start < timeout:
+    while time.time() - start < 300:
         try:
-            resp = httpx.get(f"{url}/health", timeout=5)
-            if resp.status_code == 200:
-                return True
+            if httpx.get(f"{ENV_URL}/health", timeout=5).status_code == 200:
+                break
         except httpx.RequestError:
             pass
         time.sleep(1)
-    return False
-
-
-def start_environment():
-    """Start a fresh environment container (always restarts)."""
-    env_file = ENVIRONMENT_DIR / ".env"
-    env_example = ENVIRONMENT_DIR / ".env.example"
-    if not env_file.exists() and env_example.exists():
-        log("Creating .env from .env.example...")
-        shutil.copy(env_example, env_file)
-    elif not env_file.exists():
-        log("Creating empty .env file...")
-        env_file.touch()
-
-    log("Stopping any existing environment containers...")
-    subprocess.run(
-        ["docker", "compose", "down", "-v"], cwd=ENVIRONMENT_DIR, capture_output=True
-    )
-
-    log("Building and starting environment container...")
-    result = subprocess.run(
-        ["docker", "compose", "up", "-d", "--build"], cwd=ENVIRONMENT_DIR
-    )
-    if result.returncode != 0:
-        log("ERROR: Failed to start environment")
-        sys.exit(1)
-
-    log("Waiting for environment to be healthy...")
-    if not wait_for_health(ENV_URL):
-        subprocess.run(["docker", "compose", "logs"], cwd=ENVIRONMENT_DIR)
+    else:
+        subprocess.run(["docker", "logs", container_name])
         log("ERROR: Environment failed to start")
         sys.exit(1)
 
-    log("Environment started")
+    log("Waiting for MCP startup...")
+    start = time.time()
+    while time.time() - start < 300:
+        logs = subprocess.run(
+            ["docker", "logs", container_name], capture_output=True, text=True
+        )
+        if "Startup complete!" in logs.stdout or "Startup complete!" in logs.stderr:
+            break
+        time.sleep(1)
+
+    log("Environment ready")
 
 
 def tar_gz_to_zip(tar_gz_path: Path) -> Path:
@@ -105,291 +168,140 @@ def tar_gz_to_zip(tar_gz_path: Path) -> Path:
     return zip_path
 
 
+def snapshot(url: str, out_path: Path) -> Path:
+    """Capture a snapshot and return the zip path."""
+    import httpx
+
+    with httpx.stream("POST", f"{url}/data/snapshot") as resp:
+        resp.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in resp.iter_bytes(chunk_size=65536):
+                f.write(chunk)
+    return tar_gz_to_zip(out_path)
+
+
 def main():
-    # Parse task selector from command line (index, task ID, or use default)
-    task_selector = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TASK
+    import httpx  # noqa: F811
 
-    # Load task and world data from HuggingFace
-    log("Downloading task data from HuggingFace...")
-    tasks_path = hf_hub_download(
-        HF_DATASET, "tasks_and_rubrics.json", repo_type="dataset"
-    )
-    worlds_path = hf_hub_download(
-        HF_DATASET, "world_descriptions.json", repo_type="dataset"
-    )
+    selector = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TASK_SLUG
+    world_dir, task_slug = find_world_and_slug(selector)
+    config_dir = world_dir / "runner_configs" / task_slug
 
-    with open(tasks_path) as f:
-        tasks = json.load(f)
-    with open(worlds_path) as f:
-        worlds = {w["world_id"]: w for w in json.load(f)}
-
-    # Find the task
-    if task_selector.isdigit():
-        task_index = int(task_selector)
-        if task_index < 0 or task_index >= len(tasks):
-            log(f"ERROR: Task index out of range (0-{len(tasks) - 1})")
-            sys.exit(1)
-        task = tasks[task_index]
-    else:
-        task = next((t for t in tasks if t["task_id"] == task_selector), None)
-        if not task:
-            log(f"ERROR: Task not found: {task_selector}")
-            sys.exit(1)
-
-    world_id = task["world_id"]
-    world = worlds.get(world_id)
-    if not world:
-        log(f"ERROR: World not found: {world_id}")
-        sys.exit(1)
-
-    trajectory_id = f"hf_{task['task_id']}_{uuid.uuid4().hex[:8]}"
+    trajectory_id = f"hf_{task_slug}_{uuid.uuid4().hex[:8]}"
     grading_run_id = f"gr_{uuid.uuid4().hex[:8]}"
-    output_dir = EXAMPLE_DIR / "output" / task["task_id"]
+    output_dir = EXAMPLE_DIR / "output" / task_slug
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log("=" * 60)
-    log(f"Task: {task['task_name']}")
-    log(f"Domain: {task['domain']}")
-    log(f"World: {world['world_name']}")
-    log(f"Prompt: {task['prompt'][:100]}...")
+    log(f"Task slug: {task_slug}")
+    log(f"World dir: {world_dir}")
+    log(f"Config dir: {config_dir}")
     log("=" * 60)
 
-    start_environment()
+    image_ref = load_docker_image(world_dir)
+    container_name = f"hf_task_{task_slug}_{os.getpid()}"
+    env_file = world_dir / ".env"
 
-    # Download and extract world snapshot
-    log(f"Downloading world snapshot: {world_id}")
-    zip_path = hf_hub_download(
-        HF_DATASET, f"world_files_zipped/{world_id}.zip", repo_type="dataset"
-    )
-    world_zip = output_dir / f"{world_id}.zip"
-    shutil.copy(zip_path, world_zip)
+    try:
+        start_container(image_ref, task_slug, container_name, env_file)
 
-    log("Populating environment with world snapshot...")
-    with zipfile.ZipFile(world_zip, "r") as zf:
-        names = zf.namelist()
+        # Capture initial snapshot
+        log("Capturing initial snapshot...")
+        initial_zip = snapshot(ENV_URL, output_dir / "initial_snapshot.tar.gz")
 
-        for subsystem in ["filesystem", ".apps_data"]:
-            subsystem_files = [n for n in names if n.startswith(f"{subsystem}/")]
-            if not subsystem_files:
-                continue
+        # Load configs from runner_configs
+        with open(config_dir / "orchestrator_config.json") as f:
+            orch_config = json.load(f)
+        orchestrator_model = os.environ.get("ORCHESTRATOR_MODEL") or orch_config["orchestrator_model"]
 
-            log(f"  Populating {subsystem} ({len(subsystem_files)} files)...")
-            subsystem_tar = output_dir / f"{subsystem}.tar.gz"
+        # Run agent
+        log("Running agent...")
+        trajectory_file = output_dir / "trajectory.json"
+        agent_cmd = [
+            "uv", "run", "python", "-m", "runner.main",
+            "--trajectory-id", trajectory_id,
+            "--initial-messages", str(config_dir / "initial_messages.json"),
+            "--mcp-gateway-url", f"{ENV_URL}/mcp/",
+            "--agent-config", str(config_dir / "agent_config.json"),
+            "--orchestrator-model", orchestrator_model,
+            "--output", str(trajectory_file),
+        ]
 
-            with tarfile.open(subsystem_tar, "w:gz") as tar:
-                for name in subsystem_files:
-                    new_name = name[len(f"{subsystem}/") :]
-                    if not new_name:
-                        continue
-                    info = tarfile.TarInfo(name=new_name)
-                    if name.endswith("/"):
-                        info.type = tarfile.DIRTYPE
-                        info.mode = 0o755
-                        tar.addfile(info)
-                    else:
-                        data = zf.read(name)
-                        info.size = len(data)
-                        info.mode = 0o644
-                        tar.addfile(info, io.BytesIO(data))
+        extra_args = orch_config.get("orchestrator_extra_args")
+        if extra_args:
+            extra_args_file = output_dir / "orchestrator_extra_args.json"
+            with open(extra_args_file, "w") as f:
+                json.dump(extra_args, f)
+            agent_cmd.extend(["--orchestrator-extra-args", str(extra_args_file)])
 
-            with open(subsystem_tar, "rb") as f:
-                resp = httpx.post(
-                    f"{ENV_URL}/data/populate",
-                    files={
-                        "archive": (f"{subsystem}.tar.gz", f.read(), "application/gzip")
-                    },
-                    params={"subsystem": subsystem},
-                    timeout=600.0,
-                )
-                if resp.status_code != 200:
-                    log(f"ERROR: Failed to populate {subsystem}: {resp.text}")
-                    sys.exit(1)
-                log(f"  {subsystem}: {resp.json()}")
+        result = subprocess.run(agent_cmd, cwd=AGENTS_DIR)
+        if result.returncode != 0:
+            log(f"WARNING: Agent exited with code {result.returncode}")
 
-    # Configure MCP servers using the all-servers config
-    log("Configuring MCP servers...")
-    with open(EXAMPLE_DIR / "mcp_config_all_oss_servers.json") as f:
-        mcp_config = json.load(f)
-    log(f"  Servers: {list(mcp_config['mcpServers'].keys())}")
-
-    resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=600.0)
-    resp.raise_for_status()
-    log("MCP servers configured")
-
-    # Generate initial messages from HuggingFace task prompt
-    # System prompt from agents/runner/agents/react_toolbelt_agent/README.md
-    system_prompt = """You are an AI assistant that completes tasks by reasoning and using tools.
-
-## Think Before Acting
-
-Before making tool calls, briefly explain your reasoning in 1-3 sentences:
-- What you learned from the previous step
-- What you're doing next and why
-
-Don't over-explain. Be concise but show your thinking.
-
-## Tools
-
-**Always Available (Meta-Tools):**
-- `todo_write` - Task planning: create/update todos. Takes `todos` array [{id, content, status}] and `merge` boolean.
-- `toolbelt_list_tools` / `toolbelt_inspect_tool` / `toolbelt_add_tool` / `toolbelt_remove_tool` - Tool management
-- `final_answer` - Submit your answer (status: completed/blocked/failed)
-
-**Domain Tools:** Use `toolbelt_list_tools` to discover, then `toolbelt_add_tool` to add them.
-
-## Workflow
-
-1. Plan: Use `todo_write` to create todos for complex tasks
-2. Discover: Use `toolbelt_list_tools` to find relevant tools
-3. Execute: Work through todos, use `todo_write` with `merge=true` to update status
-4. Complete: Call `final_answer` (all todos must be completed/cancelled first)
-
-## Rules
-
-- Update todo status with `todo_write`: set `in_progress` when starting, `completed` when done
-- Show your work for calculations
-- `final_answer` is rejected if todos are incomplete
-"""
-    initial_messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task["prompt"]},
-    ]
-    with open(output_dir / "initial_messages.json", "w") as f:
-        json.dump(initial_messages, f, indent=2)
-
-    # Load orchestrator config
-    with open(EXAMPLE_DIR / "orchestrator_config.json") as f:
-        orchestrator_config = json.load(f)
-
-    trajectory_file = output_dir / "trajectory.json"
-
-    # Run agent
-    log("Running agent...")
-    agent_cmd = [
-        "uv",
-        "run",
-        "python",
-        "-m",
-        "runner.main",
-        "--trajectory-id",
-        trajectory_id,
-        "--initial-messages",
-        str(output_dir / "initial_messages.json"),
-        "--mcp-gateway-url",
-        f"{ENV_URL}/mcp/",
-        "--agent-config",
-        str(EXAMPLE_DIR / "agent_config.json"),
-        "--orchestrator-model",
-        orchestrator_config["model"],
-        "--output",
-        str(trajectory_file),
-    ]
-
-    # Add extra args if present
-    if orchestrator_config.get("extra_args"):
-        extra_args_file = output_dir / "orchestrator_extra_args.json"
-        with open(extra_args_file, "w") as f:
-            json.dump(orchestrator_config["extra_args"], f)
-        agent_cmd.extend(["--orchestrator-extra-args", str(extra_args_file)])
-
-    result = subprocess.run(agent_cmd, cwd=AGENTS_DIR)
-    if result.returncode != 0:
-        log(f"WARNING: Agent exited with code {result.returncode}")
-
-    agent_status = None
-    if trajectory_file.exists():
-        with open(trajectory_file) as f:
-            trajectory = json.load(f)
-            agent_status = trajectory.get("status")
+        agent_status = None
+        if trajectory_file.exists():
+            with open(trajectory_file) as f:
+                agent_status = json.load(f).get("status")
             log(f"Agent status: {agent_status}")
 
-    # Save final snapshot
-    log("Saving final snapshot...")
-    with httpx.stream("POST", f"{ENV_URL}/data/snapshot") as resp:
-        resp.raise_for_status()
-        final_tar_gz = output_dir / "final_snapshot.tar.gz"
-        with open(final_tar_gz, "wb") as f:
-            for chunk in resp.iter_bytes(chunk_size=65536):
-                f.write(chunk)
+        # Capture final snapshot
+        log("Saving final snapshot...")
+        final_zip = snapshot(ENV_URL, output_dir / "final_snapshot.tar.gz")
+        log(f"Saved: {final_zip}")
 
-    final_zip = tar_gz_to_zip(final_tar_gz)
-    log(f"Saved: {final_zip}")
+        # Run grading if agent completed
+        if agent_status != "completed":
+            log(f"Skipping grading (agent status: {agent_status})")
+        else:
+            log("Running grading...")
 
-    # Run grading if agent completed
-    if agent_status != "completed":
-        log(f"Skipping grading (agent status: {agent_status})")
-    else:
-        log("Running grading...")
+            grading_config_file = config_dir / "grading_config.json"
+            with open(grading_config_file) as f:
+                grading_config = json.load(f)
 
-        # Generate verifiers from HuggingFace rubric
-        verifiers = [
-            {
-                "verifier_id": c["verifier_id"],
-                "verifier_version": 1,
-                "world_id": world_id,
-                "task_id": task["task_id"],
-                "eval_config_id": "ec_output_llm",
-                "verifier_values": {
-                    "criteria": c["criteria"],
-                    "is_primary_objective": i == 0,
-                },
-                "verifier_index": i,
-                "verifier_dependencies": None,
-            }
-            for i, c in enumerate(task.get("rubric", []))
-        ]
-        with open(output_dir / "verifiers.json", "w") as f:
-            json.dump(verifiers, f, indent=2)
+            # Write grading sub-configs to output dir
+            for key in ("verifiers", "grading_settings", "eval_configs", "scoring_config"):
+                with open(output_dir / f"{key}.json", "w") as f:
+                    json.dump(grading_config[key], f, indent=2)
 
-        grades_file = output_dir / "grades.json"
+            grades_file = output_dir / "grades.json"
+            grading_cmd = [
+                "uv", "run", "python", "-m", "runner.main",
+                "--grading-run-id", grading_run_id,
+                "--trajectory-id", trajectory_id,
+                "--initial-snapshot", str(initial_zip),
+                "--final-snapshot", str(final_zip),
+                "--trajectory", str(trajectory_file),
+                "--grading-settings", str(output_dir / "grading_settings.json"),
+                "--verifiers", str(output_dir / "verifiers.json"),
+                "--eval-configs", str(output_dir / "eval_configs.json"),
+                "--scoring-config", str(output_dir / "scoring_config.json"),
+                "--output", str(grades_file),
+            ]
 
-        grading_cmd = [
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "runner.main",
-            "--grading-run-id",
-            grading_run_id,
-            "--trajectory-id",
-            trajectory_id,
-            "--initial-snapshot",
-            str(world_zip),
-            "--final-snapshot",
-            str(final_zip),
-            "--trajectory",
-            str(trajectory_file),
-            "--grading-settings",
-            str(EXAMPLE_DIR / "grading_settings.json"),
-            "--verifiers",
-            str(output_dir / "verifiers.json"),
-            "--eval-configs",
-            str(EXAMPLE_DIR / "eval_configs.json"),
-            "--scoring-config",
-            str(EXAMPLE_DIR / "scoring_config.json"),
-            "--output",
-            str(grades_file),
-        ]
+            result = subprocess.run(grading_cmd, cwd=GRADING_DIR)
+            if result.returncode != 0:
+                log(f"WARNING: Grading exited with code {result.returncode}")
 
-        result = subprocess.run(grading_cmd, cwd=GRADING_DIR)
-        if result.returncode != 0:
-            log(f"WARNING: Grading exited with code {result.returncode}")
+            if grades_file.exists():
+                with open(grades_file) as f:
+                    grades = json.load(f)
+                log("=" * 60)
+                log("GRADING RESULTS")
+                log("=" * 60)
+                log(f"Status: {grades.get('grading_run_status')}")
+                log(f"Final Score: {grades.get('scoring_results', {}).get('final_score')}")
+                for vr in grades.get("verifier_results", []):
+                    log(f"  - {vr.get('verifier_id')}: {vr.get('score')}")
 
-        if grades_file.exists():
-            with open(grades_file) as f:
-                grades = json.load(f)
-            log("=" * 60)
-            log("GRADING RESULTS")
-            log("=" * 60)
-            log(f"Status: {grades.get('grading_run_status')}")
-            log(f"Final Score: {grades.get('scoring_results', {}).get('final_score')}")
-            for vr in grades.get("verifier_results", []):
-                log(f"  - {vr.get('verifier_id')}: {vr.get('score')}")
+        log("=" * 60)
+        log("DONE")
+        log(f"Output: {output_dir}")
+        log("=" * 60)
 
-    log("=" * 60)
-    log("DONE")
-    log(f"Output: {output_dir}")
-    log("=" * 60)
+    finally:
+        log(f"Stopping container {container_name}...")
+        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
 
 
 if __name__ == "__main__":

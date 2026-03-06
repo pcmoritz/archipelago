@@ -1,16 +1,17 @@
 #!/bin/bash
 #
-# Run a task from the mercor/apex-agents HuggingFace dataset.
+# Run a task using a pre-built Docker image from /home/ubuntu/docker/.
 #
 # Usage:
 #   cd archipelago/examples/hugging_face_task
-#   ./run.sh                    # Run default task (Investment Banking)
-#   ./run.sh 42                 # Run task at index 42
-#   ./run.sh task_abc123        # Run task by ID
+#   ./run.sh                              # Run default task
+#   ./run.sh world221-tr-01-9ba58a61      # Run by task slug
+#   ./run.sh /home/ubuntu/docker/...      # Run by world directory (first task)
 #
 # Prerequisites:
 #   - Docker running
 #   - LLM API key set in agents/.env
+#   - .env file in the world directory with required secrets
 #
 
 set -e
@@ -19,13 +20,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARCHIPELAGO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 export EXAMPLE_DIR="$SCRIPT_DIR"
-export ENVIRONMENT_DIR="$ARCHIPELAGO_DIR/environment"
 export AGENTS_DIR="$ARCHIPELAGO_DIR/agents"
 export GRADING_DIR="$ARCHIPELAGO_DIR/grading"
-export ENV_URL="http://localhost:8080"
 
 echo "============================================================"
-echo "HUGGING FACE TASK"
+echo "DOCKER IMAGE TASK"
 echo "============================================================"
 echo "Example dir:     $EXAMPLE_DIR"
 echo "Archipelago dir: $ARCHIPELAGO_DIR"
@@ -36,8 +35,8 @@ echo "Installing agent dependencies..."
 cd "$AGENTS_DIR"
 uv sync
 
-# Install huggingface_hub for downloading from HuggingFace dataset
-uv pip install -q huggingface_hub
+# Install httpx for health checks
+uv pip install -q httpx
 
 # Install grading dependencies
 echo "Installing grading dependencies..."
