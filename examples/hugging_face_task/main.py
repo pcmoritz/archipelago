@@ -19,12 +19,16 @@ import uuid
 import zipfile
 from pathlib import Path
 
+from huggingface_hub import hf_hub_download
+
 EXAMPLE_DIR = Path(os.environ.get("EXAMPLE_DIR", Path(__file__).parent))
 ARCHIPELAGO_DIR = Path(os.environ.get("ARCHIPELAGO_DIR", EXAMPLE_DIR.parent.parent))
 AGENTS_DIR = Path(os.environ.get("AGENTS_DIR", ARCHIPELAGO_DIR / "agents"))
 GRADING_DIR = Path(os.environ.get("GRADING_DIR", ARCHIPELAGO_DIR / "grading"))
 
 DOCKER_IMAGES_DIR = Path(os.environ.get("DOCKER_IMAGES_DIR", "/home/ubuntu/docker"))
+
+HF_DATASET = "mercor/apex-agents"
 
 DEFAULT_TASK_SLUG = "world221-tr-01-9ba58a61"
 
@@ -216,7 +220,6 @@ def main():
 
     selector = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TASK_SLUG
     world_dir, task_slug = find_world_and_slug(selector)
-    config_dir = world_dir / "runner_configs" / task_slug
 
     trajectory_id = f"hf_{task_slug}_{uuid.uuid4().hex[:8]}"
     grading_run_id = f"gr_{uuid.uuid4().hex[:8]}"
@@ -226,7 +229,6 @@ def main():
     log("=" * 60)
     log(f"Task slug: {task_slug}")
     log(f"World dir: {world_dir}")
-    log(f"Config dir: {config_dir}")
     log("=" * 60)
 
     image_ref = load_docker_image(world_dir)
@@ -240,10 +242,71 @@ def main():
         log("Capturing initial snapshot...")
         initial_zip = snapshot(env_url, output_dir / "initial_snapshot.tar.gz")
 
-        # Load configs from runner_configs
-        with open(config_dir / "orchestrator_config.json") as f:
-            orch_config = json.load(f)
-        orchestrator_model = os.environ.get("ORCHESTRATOR_MODEL") or orch_config["orchestrator_model"]
+        # Download task data from HuggingFace (for prompt and rubric)
+        log("Downloading task data from HuggingFace...")
+        tasks_path = hf_hub_download(
+            HF_DATASET, "tasks_and_rubrics.json", repo_type="dataset"
+        )
+        with open(tasks_path) as f:
+            hf_tasks = json.load(f)
+
+        # Map task slug suffix to HF task_id
+        slug_suffix = task_slug.split("-")[-1]
+        task = next(
+            (t for t in hf_tasks if t["task_id"].split("_")[-1].startswith(slug_suffix)),
+            None,
+        )
+        if not task:
+            log(f"ERROR: Could not find HF task matching slug suffix '{slug_suffix}'")
+            sys.exit(1)
+        log(f"HF Task: {task['task_name']}")
+
+        # Generate initial messages from HuggingFace task prompt
+        # System prompt from agents/runner/agents/react_toolbelt_agent/README.md
+        system_prompt = """You are an AI assistant that completes tasks by reasoning and using tools.
+
+## Think Before Acting
+
+Before making tool calls, briefly explain your reasoning in 1-3 sentences:
+- What you learned from the previous step
+- What you're doing next and why
+
+Don't over-explain. Be concise but show your thinking.
+
+## Tools
+
+**Always Available (Meta-Tools):**
+- `todo_write` - Task planning: create/update todos. Takes `todos` array [{id, content, status}] and `merge` boolean.
+- `toolbelt_list_tools` / `toolbelt_inspect_tool` / `toolbelt_add_tool` / `toolbelt_remove_tool` - Tool management
+- `final_answer` - Submit your answer (status: completed/blocked/failed)
+
+**Domain Tools:** Use `toolbelt_list_tools` to discover, then `toolbelt_add_tool` to add them.
+
+## Workflow
+
+1. Plan: Use `todo_write` to create todos for complex tasks
+2. Discover: Use `toolbelt_list_tools` to find relevant tools
+3. Execute: Work through todos, use `todo_write` with `merge=true` to update status
+4. Complete: Call `final_answer` (all todos must be completed/cancelled first)
+
+## Rules
+
+- Update todo status with `todo_write`: set `in_progress` when starting, `completed` when done
+- Show your work for calculations
+- `final_answer` is rejected if todos are incomplete
+"""
+        initial_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task["prompt"]},
+        ]
+        with open(output_dir / "initial_messages.json", "w") as f:
+            json.dump(initial_messages, f, indent=2)
+
+        # Load orchestrator config
+        with open(EXAMPLE_DIR / "orchestrator_config.json") as f:
+            orchestrator_config = json.load(f)
+
+        orchestrator_model = os.environ.get("ORCHESTRATOR_MODEL") or orchestrator_config["model"]
 
         # Run agent
         log("Running agent...")
@@ -251,18 +314,18 @@ def main():
         agent_cmd = [
             "uv", "run", "python", "-m", "runner.main",
             "--trajectory-id", trajectory_id,
-            "--initial-messages", str(config_dir / "initial_messages.json"),
+            "--initial-messages", str(output_dir / "initial_messages.json"),
             "--mcp-gateway-url", f"{env_url}/mcp/",
-            "--agent-config", str(config_dir / "agent_config.json"),
+            "--agent-config", str(EXAMPLE_DIR / "agent_config.json"),
             "--orchestrator-model", orchestrator_model,
             "--output", str(trajectory_file),
         ]
 
-        extra_args = orch_config.get("orchestrator_extra_args")
-        if extra_args:
+        # Add extra args if present
+        if orchestrator_config.get("extra_args"):
             extra_args_file = output_dir / "orchestrator_extra_args.json"
             with open(extra_args_file, "w") as f:
-                json.dump(extra_args, f)
+                json.dump(orchestrator_config["extra_args"], f)
             agent_cmd.extend(["--orchestrator-extra-args", str(extra_args_file)])
 
         result = subprocess.run(agent_cmd, cwd=AGENTS_DIR)
@@ -272,10 +335,11 @@ def main():
         agent_status = None
         if trajectory_file.exists():
             with open(trajectory_file) as f:
-                agent_status = json.load(f).get("status")
-            log(f"Agent status: {agent_status}")
+                trajectory = json.load(f)
+                agent_status = trajectory.get("status")
+                log(f"Agent status: {agent_status}")
 
-        # Capture final snapshot
+        # Save final snapshot
         log("Saving final snapshot...")
         final_zip = snapshot(env_url, output_dir / "final_snapshot.tar.gz")
         log(f"Saved: {final_zip}")
@@ -286,14 +350,25 @@ def main():
         else:
             log("Running grading...")
 
-            grading_config_file = config_dir / "grading_config.json"
-            with open(grading_config_file) as f:
-                grading_config = json.load(f)
-
-            # Write grading sub-configs to output dir
-            for key in ("verifiers", "grading_settings", "eval_configs", "scoring_config"):
-                with open(output_dir / f"{key}.json", "w") as f:
-                    json.dump(grading_config[key], f, indent=2)
+            # Generate verifiers from HuggingFace rubric
+            verifiers = [
+                {
+                    "verifier_id": c["verifier_id"],
+                    "verifier_version": 1,
+                    "world_id": task["world_id"],
+                    "task_id": task["task_id"],
+                    "eval_config_id": "ec_output_llm",
+                    "verifier_values": {
+                        "criteria": c["criteria"],
+                        "is_primary_objective": i == 0,
+                    },
+                    "verifier_index": i,
+                    "verifier_dependencies": None,
+                }
+                for i, c in enumerate(task.get("rubric", []))
+            ]
+            with open(output_dir / "verifiers.json", "w") as f:
+                json.dump(verifiers, f, indent=2)
 
             grades_file = output_dir / "grades.json"
             grading_cmd = [
@@ -303,10 +378,10 @@ def main():
                 "--initial-snapshot", str(initial_zip),
                 "--final-snapshot", str(final_zip),
                 "--trajectory", str(trajectory_file),
-                "--grading-settings", str(output_dir / "grading_settings.json"),
+                "--grading-settings", str(EXAMPLE_DIR / "grading_settings.json"),
                 "--verifiers", str(output_dir / "verifiers.json"),
-                "--eval-configs", str(output_dir / "eval_configs.json"),
-                "--scoring-config", str(output_dir / "scoring_config.json"),
+                "--eval-configs", str(EXAMPLE_DIR / "eval_configs.json"),
+                "--scoring-config", str(EXAMPLE_DIR / "scoring_config.json"),
                 "--output", str(grades_file),
             ]
 

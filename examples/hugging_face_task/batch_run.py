@@ -57,11 +57,15 @@ def run_task(slug, max_retries=3):
     env["DOCKER_IMAGES_DIR"] = str(DOCKER_DIR)
     start = time.time()
     for attempt in range(1, max_retries + 1):
-        with open(out / "run.log", "w") as lf:
-            rc = subprocess.run(
-                [sys.executable, str(SCRIPT_DIR / "main.py"), slug],
-                env=env, stdout=lf, stderr=subprocess.STDOUT, timeout=1800,
-            ).returncode
+        try:
+            with open(out / "run.log", "w") as lf:
+                rc = subprocess.run(
+                    [sys.executable, str(SCRIPT_DIR / "main.py"), slug],
+                    env=env, stdout=lf, stderr=subprocess.STDOUT, timeout=1800,
+                ).returncode
+        except subprocess.TimeoutExpired:
+            log(f"TIMEOUT {slug} (attempt {attempt}/{max_retries})")
+            rc = -1
         if rc == 0 or attempt == max_retries:
             break
         log(f"Retrying {slug} (attempt {attempt + 1}/{max_retries})")
@@ -104,7 +108,14 @@ def main():
             for slug in tasks
         }
         for f in as_completed(futures):
-            slug, rc, score, elapsed = f.result()
+            try:
+                slug, rc, score, elapsed = f.result()
+            except Exception as exc:
+                slug = futures[f]
+                log(f"[{done + 1}/{len(tasks)}] ERROR {slug}: {exc}")
+                done += 1
+                failed += 1
+                continue
             done += 1
             if rc != 0:
                 failed += 1
