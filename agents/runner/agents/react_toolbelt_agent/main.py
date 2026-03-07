@@ -23,7 +23,7 @@ from runner.agents.models import (
     LitellmOutputMessage,
 )
 from runner.utils.error import is_fatal_mcp_error, is_system_error
-from runner.utils.llm import generate_response
+from runner.utils.llm import generate_response, generate_response_via_responses_api
 from runner.utils.mcp import build_mcp_gateway_schema, content_blocks_to_messages
 from runner.utils.usage import UsageTracker
 
@@ -119,7 +119,12 @@ class ReActAgent:
 
         # Call LLM
         try:
-            response: ModelResponse = await generate_response(
+            llm_fn = (
+                generate_response_via_responses_api
+                if self.extra_args.get("use_responses_api")
+                else generate_response
+            )
+            response: ModelResponse = await llm_fn(
                 self.model,
                 self.messages,
                 self._get_tools(),

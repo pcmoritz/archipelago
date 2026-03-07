@@ -1,3 +1,7 @@
 {
-  "model": "gemini/gemini-3-pro-preview"
+  "model": "openai/gpt-5.4",
+  "extra_args": {
+    "reasoning_effort": "high",
+    "use_responses_api": true
+  }
 }
