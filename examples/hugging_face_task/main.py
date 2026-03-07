@@ -8,6 +8,7 @@ Usage:
     ./main.py /home/ubuntu/docker/investment-banking-world-221--(world_f83f49b3776b4b5e870c36091f7e2b0b)  # Run by world dir (first task)
 """
 
+import atexit
 import json
 import os
 import re
@@ -19,6 +20,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
+import httpx
 from huggingface_hub import hf_hub_download
 
 EXAMPLE_DIR = Path(os.environ.get("EXAMPLE_DIR", Path(__file__).parent))
@@ -76,8 +78,7 @@ def load_docker_image(world_dir: Path) -> str:
 
     if os.environ.get("SKIP_DOCKER_LOAD") == "1":
         # Image already loaded; extract the tag from the tar manifest
-        import tarfile as _tarfile
-        with _tarfile.open(str(image_tar), "r") as tf:
+        with tarfile.open(str(image_tar), "r") as tf:
             manifest = json.loads(tf.extractfile("manifest.json").read())
         tags = manifest[0].get("RepoTags", [])
         if tags:
@@ -121,8 +122,6 @@ def get_container_ip(container_name: str) -> str:
 
 def start_container(image_ref: str, task_slug: str, container_name: str, env_file: Path | None) -> str:
     """Start the pre-built docker container. Returns the environment base URL."""
-    import httpx
-
     subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
 
     cmd = [
@@ -187,6 +186,16 @@ def start_container(image_ref: str, task_slug: str, container_name: str, env_fil
     return env_url
 
 
+def snapshot(url: str, out_path: Path) -> Path:
+    """Capture a snapshot and return the zip path."""
+    with httpx.stream("POST", f"{url}/data/snapshot") as resp:
+        resp.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in resp.iter_bytes(chunk_size=65536):
+                f.write(chunk)
+    return tar_gz_to_zip(out_path)
+
+
 def tar_gz_to_zip(tar_gz_path: Path) -> Path:
     """Convert tar.gz to zip for grading."""
     stem = tar_gz_path.stem
@@ -203,21 +212,7 @@ def tar_gz_to_zip(tar_gz_path: Path) -> Path:
     return zip_path
 
 
-def snapshot(url: str, out_path: Path) -> Path:
-    """Capture a snapshot and return the zip path."""
-    import httpx
-
-    with httpx.stream("POST", f"{url}/data/snapshot") as resp:
-        resp.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in resp.iter_bytes(chunk_size=65536):
-                f.write(chunk)
-    return tar_gz_to_zip(out_path)
-
-
 def main():
-    import httpx  # noqa: F811
-
     selector = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TASK_SLUG
     world_dir, task_slug = find_world_and_slug(selector)
 
@@ -235,35 +230,39 @@ def main():
     container_name = f"hf_task_{task_slug}_{os.getpid()}"
     env_file = world_dir / ".env"
 
-    try:
-        env_url = start_container(image_ref, task_slug, container_name, env_file)
+    atexit.register(lambda: (
+        log(f"Stopping container {container_name}..."),
+        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True),
+    ))
 
-        # Capture initial snapshot
-        log("Capturing initial snapshot...")
-        initial_zip = snapshot(env_url, output_dir / "initial_snapshot.tar.gz")
+    env_url = start_container(image_ref, task_slug, container_name, env_file)
 
-        # Download task data from HuggingFace (for prompt and rubric)
-        log("Downloading task data from HuggingFace...")
-        tasks_path = hf_hub_download(
-            HF_DATASET, "tasks_and_rubrics.json", repo_type="dataset"
-        )
-        with open(tasks_path) as f:
-            hf_tasks = json.load(f)
+    # Capture initial snapshot
+    log("Capturing initial snapshot...")
+    initial_zip = snapshot(env_url, output_dir / "initial_snapshot.tar.gz")
 
-        # Map task slug suffix to HF task_id
-        slug_suffix = task_slug.split("-")[-1]
-        task = next(
-            (t for t in hf_tasks if t["task_id"].split("_")[-1].startswith(slug_suffix)),
-            None,
-        )
-        if not task:
-            log(f"ERROR: Could not find HF task matching slug suffix '{slug_suffix}'")
-            sys.exit(1)
-        log(f"HF Task: {task['task_name']}")
+    # Download task data from HuggingFace (for prompt and rubric)
+    log("Downloading task data from HuggingFace...")
+    tasks_path = hf_hub_download(
+        HF_DATASET, "tasks_and_rubrics.json", repo_type="dataset"
+    )
+    with open(tasks_path) as f:
+        hf_tasks = json.load(f)
 
-        # Generate initial messages from HuggingFace task prompt
-        # System prompt from agents/runner/agents/react_toolbelt_agent/README.md
-        system_prompt = """You are an AI assistant that completes tasks by reasoning and using tools.
+    # Map task slug suffix to HF task_id
+    slug_suffix = task_slug.split("-")[-1]
+    task = next(
+        (t for t in hf_tasks if t["task_id"].split("_")[-1].startswith(slug_suffix)),
+        None,
+    )
+    if not task:
+        log(f"ERROR: Could not find HF task matching slug suffix '{slug_suffix}'")
+        sys.exit(1)
+    log(f"HF Task: {task['task_name']}")
+
+    # Generate initial messages from HuggingFace task prompt
+    # System prompt from agents/runner/agents/react_toolbelt_agent/README.md
+    system_prompt = """You are an AI assistant that completes tasks by reasoning and using tools.
 
 ## Think Before Acting
 
@@ -295,119 +294,141 @@ Don't over-explain. Be concise but show your thinking.
 - Show your work for calculations
 - `final_answer` is rejected if todos are incomplete
 """
-        initial_messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": task["prompt"]},
+    initial_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": task["prompt"]},
+    ]
+    with open(output_dir / "initial_messages.json", "w") as f:
+        json.dump(initial_messages, f, indent=2)
+
+    # Load orchestrator config
+    with open(EXAMPLE_DIR / "orchestrator_config.json") as f:
+        orchestrator_config = json.load(f)
+
+    orchestrator_model = os.environ.get("ORCHESTRATOR_MODEL") or orchestrator_config["model"]
+
+    trajectory_file = output_dir / "trajectory.json"
+
+    # Run agent
+    log("Running agent...")
+    agent_cmd = [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "runner.main",
+        "--trajectory-id",
+        trajectory_id,
+        "--initial-messages",
+        str(output_dir / "initial_messages.json"),
+        "--mcp-gateway-url",
+        f"{env_url}/mcp/",
+        "--agent-config",
+        str(EXAMPLE_DIR / "agent_config.json"),
+        "--orchestrator-model",
+        orchestrator_model,
+        "--output",
+        str(trajectory_file),
+    ]
+
+    # Add extra args if present
+    if orchestrator_config.get("extra_args"):
+        extra_args_file = output_dir / "orchestrator_extra_args.json"
+        with open(extra_args_file, "w") as f:
+            json.dump(orchestrator_config["extra_args"], f)
+        agent_cmd.extend(["--orchestrator-extra-args", str(extra_args_file)])
+
+    result = subprocess.run(agent_cmd, cwd=AGENTS_DIR)
+    if result.returncode != 0:
+        log(f"WARNING: Agent exited with code {result.returncode}")
+
+    agent_status = None
+    if trajectory_file.exists():
+        with open(trajectory_file) as f:
+            trajectory = json.load(f)
+            agent_status = trajectory.get("status")
+            log(f"Agent status: {agent_status}")
+
+    # Save final snapshot
+    log("Saving final snapshot...")
+    final_zip = snapshot(env_url, output_dir / "final_snapshot.tar.gz")
+    log(f"Saved: {final_zip}")
+
+    # Run grading if agent completed
+    if agent_status != "completed":
+        log(f"Skipping grading (agent status: {agent_status})")
+    else:
+        log("Running grading...")
+
+        # Generate verifiers from HuggingFace rubric
+        verifiers = [
+            {
+                "verifier_id": c["verifier_id"],
+                "verifier_version": 1,
+                "world_id": task["world_id"],
+                "task_id": task["task_id"],
+                "eval_config_id": "ec_output_llm",
+                "verifier_values": {
+                    "criteria": c["criteria"],
+                    "is_primary_objective": i == 0,
+                },
+                "verifier_index": i,
+                "verifier_dependencies": None,
+            }
+            for i, c in enumerate(task.get("rubric", []))
         ]
-        with open(output_dir / "initial_messages.json", "w") as f:
-            json.dump(initial_messages, f, indent=2)
+        with open(output_dir / "verifiers.json", "w") as f:
+            json.dump(verifiers, f, indent=2)
 
-        # Load orchestrator config
-        with open(EXAMPLE_DIR / "orchestrator_config.json") as f:
-            orchestrator_config = json.load(f)
+        grades_file = output_dir / "grades.json"
 
-        orchestrator_model = os.environ.get("ORCHESTRATOR_MODEL") or orchestrator_config["model"]
-
-        # Run agent
-        log("Running agent...")
-        trajectory_file = output_dir / "trajectory.json"
-        agent_cmd = [
-            "uv", "run", "python", "-m", "runner.main",
-            "--trajectory-id", trajectory_id,
-            "--initial-messages", str(output_dir / "initial_messages.json"),
-            "--mcp-gateway-url", f"{env_url}/mcp/",
-            "--agent-config", str(EXAMPLE_DIR / "agent_config.json"),
-            "--orchestrator-model", orchestrator_model,
-            "--output", str(trajectory_file),
+        grading_cmd = [
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "runner.main",
+            "--grading-run-id",
+            grading_run_id,
+            "--trajectory-id",
+            trajectory_id,
+            "--initial-snapshot",
+            str(initial_zip),
+            "--final-snapshot",
+            str(final_zip),
+            "--trajectory",
+            str(trajectory_file),
+            "--grading-settings",
+            str(EXAMPLE_DIR / "grading_settings.json"),
+            "--verifiers",
+            str(output_dir / "verifiers.json"),
+            "--eval-configs",
+            str(EXAMPLE_DIR / "eval_configs.json"),
+            "--scoring-config",
+            str(EXAMPLE_DIR / "scoring_config.json"),
+            "--output",
+            str(grades_file),
         ]
 
-        # Add extra args if present
-        if orchestrator_config.get("extra_args"):
-            extra_args_file = output_dir / "orchestrator_extra_args.json"
-            with open(extra_args_file, "w") as f:
-                json.dump(orchestrator_config["extra_args"], f)
-            agent_cmd.extend(["--orchestrator-extra-args", str(extra_args_file)])
-
-        result = subprocess.run(agent_cmd, cwd=AGENTS_DIR)
+        result = subprocess.run(grading_cmd, cwd=GRADING_DIR)
         if result.returncode != 0:
-            log(f"WARNING: Agent exited with code {result.returncode}")
+            log(f"WARNING: Grading exited with code {result.returncode}")
 
-        agent_status = None
-        if trajectory_file.exists():
-            with open(trajectory_file) as f:
-                trajectory = json.load(f)
-                agent_status = trajectory.get("status")
-                log(f"Agent status: {agent_status}")
+        if grades_file.exists():
+            with open(grades_file) as f:
+                grades = json.load(f)
+            log("=" * 60)
+            log("GRADING RESULTS")
+            log("=" * 60)
+            log(f"Status: {grades.get('grading_run_status')}")
+            log(f"Final Score: {grades.get('scoring_results', {}).get('final_score')}")
+            for vr in grades.get("verifier_results", []):
+                log(f"  - {vr.get('verifier_id')}: {vr.get('score')}")
 
-        # Save final snapshot
-        log("Saving final snapshot...")
-        final_zip = snapshot(env_url, output_dir / "final_snapshot.tar.gz")
-        log(f"Saved: {final_zip}")
-
-        # Run grading if agent completed
-        if agent_status != "completed":
-            log(f"Skipping grading (agent status: {agent_status})")
-        else:
-            log("Running grading...")
-
-            # Generate verifiers from HuggingFace rubric
-            verifiers = [
-                {
-                    "verifier_id": c["verifier_id"],
-                    "verifier_version": 1,
-                    "world_id": task["world_id"],
-                    "task_id": task["task_id"],
-                    "eval_config_id": "ec_output_llm",
-                    "verifier_values": {
-                        "criteria": c["criteria"],
-                        "is_primary_objective": i == 0,
-                    },
-                    "verifier_index": i,
-                    "verifier_dependencies": None,
-                }
-                for i, c in enumerate(task.get("rubric", []))
-            ]
-            with open(output_dir / "verifiers.json", "w") as f:
-                json.dump(verifiers, f, indent=2)
-
-            grades_file = output_dir / "grades.json"
-            grading_cmd = [
-                "uv", "run", "python", "-m", "runner.main",
-                "--grading-run-id", grading_run_id,
-                "--trajectory-id", trajectory_id,
-                "--initial-snapshot", str(initial_zip),
-                "--final-snapshot", str(final_zip),
-                "--trajectory", str(trajectory_file),
-                "--grading-settings", str(EXAMPLE_DIR / "grading_settings.json"),
-                "--verifiers", str(output_dir / "verifiers.json"),
-                "--eval-configs", str(EXAMPLE_DIR / "eval_configs.json"),
-                "--scoring-config", str(EXAMPLE_DIR / "scoring_config.json"),
-                "--output", str(grades_file),
-            ]
-
-            result = subprocess.run(grading_cmd, cwd=GRADING_DIR)
-            if result.returncode != 0:
-                log(f"WARNING: Grading exited with code {result.returncode}")
-
-            if grades_file.exists():
-                with open(grades_file) as f:
-                    grades = json.load(f)
-                log("=" * 60)
-                log("GRADING RESULTS")
-                log("=" * 60)
-                log(f"Status: {grades.get('grading_run_status')}")
-                log(f"Final Score: {grades.get('scoring_results', {}).get('final_score')}")
-                for vr in grades.get("verifier_results", []):
-                    log(f"  - {vr.get('verifier_id')}: {vr.get('score')}")
-
-        log("=" * 60)
-        log("DONE")
-        log(f"Output: {output_dir}")
-        log("=" * 60)
-
-    finally:
-        log(f"Stopping container {container_name}...")
-        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+    log("=" * 60)
+    log("DONE")
+    log(f"Output: {output_dir}")
+    log("=" * 60)
 
 
 if __name__ == "__main__":
