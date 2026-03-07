@@ -28,6 +28,8 @@ dependencies = [
     "pydantic-settings>=2.11.0",
     "redis>=6.4.0",
     "trafilatura>=1.12.0",
+    "tinker>=0.14.0",
+    "tinker-cookbook>=0.1.0",
 ]
 
 [dependency-groups]
@@ -66,3 +68,6 @@ ignore = [
 
 [tool.ruff.lint.mccabe]
 max-complexity = 28
+
+[tool.uv.sources]
+tinker-cookbook = { git = "https://github.com/thinking-machines-lab/tinker-cookbook.git", rev = "main" }

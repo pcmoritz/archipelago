@@ -18,8 +18,12 @@ from runner.agents.models import (
 from runner.agents.registry import get_agent_impl
 from runner.models import AgentConfig
 from runner.utils.settings import get_settings
+from runner.utils.tinker_llm import register_tinker_provider
 
 # from runner.save.main import save_results
+
+# Register Tinker as a LiteLLM custom provider so "tinker/..." models work
+register_tinker_provider()
 
 
 async def main(

@@ -21,12 +21,20 @@ import zipfile
 from pathlib import Path
 
 import httpx
+from dotenv import dotenv_values
 from huggingface_hub import hf_hub_download
 
 EXAMPLE_DIR = Path(os.environ.get("EXAMPLE_DIR", Path(__file__).parent))
 ARCHIPELAGO_DIR = Path(os.environ.get("ARCHIPELAGO_DIR", EXAMPLE_DIR.parent.parent))
 AGENTS_DIR = Path(os.environ.get("AGENTS_DIR", ARCHIPELAGO_DIR / "agents"))
 GRADING_DIR = Path(os.environ.get("GRADING_DIR", ARCHIPELAGO_DIR / "grading"))
+
+# Load agents/.env so keys like TINKER_API_KEY are available to this script.
+# Existing env vars take precedence (dotenv_values doesn't modify os.environ).
+_dotenv = dotenv_values(AGENTS_DIR / ".env")
+for _k, _v in _dotenv.items():
+    if _v is not None:
+        os.environ.setdefault(_k, _v)
 
 DOCKER_IMAGES_DIR = Path(os.environ.get("DOCKER_IMAGES_DIR", "/home/ubuntu/docker"))
 
@@ -306,6 +314,21 @@ Don't over-explain. Be concise but show your thinking.
         orchestrator_config = json.load(f)
 
     orchestrator_model = os.environ.get("ORCHESTRATOR_MODEL") or orchestrator_config["model"]
+    extra_args = dict(orchestrator_config.get("extra_args") or {})
+
+    # Tinker API support: if TINKER_API_KEY is set, use Tinker SDK via
+    # the custom LiteLLM provider (registered in runner/main.py).
+    #   TINKER_API_KEY  - required (read from agents/.env)
+    #   TINKER_MODEL    - optional, defaults to Qwen/Qwen3.5-35B-A3B
+    # The model is prefixed with "tinker/" for LiteLLM routing.
+    tinker_api_key = os.environ.get("TINKER_API_KEY")
+    if tinker_api_key:
+        tinker_model = os.environ.get("TINKER_MODEL", "Qwen/Qwen3.5-35B-A3B")
+        if not tinker_model.startswith("tinker/"):
+            orchestrator_model = f"tinker/{tinker_model}"
+        else:
+            orchestrator_model = tinker_model
+        log(f"Using Tinker SDK: {orchestrator_model}")
 
     trajectory_file = output_dir / "trajectory.json"
 
@@ -332,10 +355,10 @@ Don't over-explain. Be concise but show your thinking.
     ]
 
     # Add extra args if present
-    if orchestrator_config.get("extra_args"):
+    if extra_args:
         extra_args_file = output_dir / "orchestrator_extra_args.json"
         with open(extra_args_file, "w") as f:
-            json.dump(orchestrator_config["extra_args"], f)
+            json.dump(extra_args, f)
         agent_cmd.extend(["--orchestrator-extra-args", str(extra_args_file)])
 
     result = subprocess.run(agent_cmd, cwd=AGENTS_DIR)
