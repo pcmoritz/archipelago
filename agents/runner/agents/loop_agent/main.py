@@ -67,6 +67,7 @@ class LoopAgent:
         self.llm_response_timeout: int = config.get("llm_response_timeout", 600)
         self.max_steps: int = config.get("max_steps", 100)
         self.timeout: int = config.get("timeout", 10800)  # 3 hours
+        self.max_total_tokens: int | None = config.get("max_total_tokens", None)
 
         self.extra_args: dict[str, Any] = run_input.orchestrator_extra_args or {}
 
@@ -275,11 +276,38 @@ class LoopAgent:
                     self.start_time = time.time()
                     self.status = AgentStatus.RUNNING
 
+                    budget_exhausted = False
                     for i in range(self.max_steps):
                         if self._finalized:
                             logger.info(f"Agent loop was finalized after {i + 1} steps")
                             break
+                        if self.max_total_tokens is not None:
+                            used = self._usage_tracker.to_dict()["total_tokens"]
+                            if used >= self.max_total_tokens:
+                                logger.warning(
+                                    f"Token budget exhausted: {used}/{self.max_total_tokens}"
+                                )
+                                budget_exhausted = True
+                                break
                         logger.bind(message_type="step").info(f"Starting step {i + 1}")
+                        await self.step()
+
+                    # Give agent one last chance to respond
+                    if budget_exhausted and not self._finalized:
+                        logger.info(
+                            "Budget exhausted — forcing final step"
+                        )
+                        self.messages.append(
+                            LitellmOutputMessage(
+                                role="user",
+                                content=(
+                                    "TOKEN BUDGET EXHAUSTED. You MUST provide your final "
+                                    "answer NOW based on the work done so far. Do NOT call "
+                                    "any more tools. Respond with your best answer, even "
+                                    "if incomplete."
+                                ),
+                            )
+                        )
                         await self.step()
 
                     if not self._finalized:

@@ -264,13 +264,15 @@ def main():
     # System prompt from agents/runner/agents/react_toolbelt_agent/README.md
     system_prompt = """You are an AI assistant that completes tasks by reasoning and using tools.
 
-## Think Before Acting
+## Be Efficient
 
-Before making tool calls, briefly explain your reasoning in 1-3 sentences:
-- What you learned from the previous step
-- What you're doing next and why
-
-Don't over-explain. Be concise but show your thinking.
+You have a LIMITED token budget. Conserve tokens at every step:
+- Keep reasoning to 1-2 sentences max. No preamble, no recaps.
+- Request only the data you need. Avoid dumping entire files or databases.
+- Combine related tool calls when possible.
+- Remove tools from your toolbelt when no longer needed (`toolbelt_remove_tool`).
+- Do NOT repeat information from previous steps. Refer to it briefly.
+- Skip todos for simple tasks — go straight to tool calls and `final_answer`.
 
 ## Tools
 
@@ -283,15 +285,15 @@ Don't over-explain. Be concise but show your thinking.
 
 ## Workflow
 
-1. Plan: Use `todo_write` to create todos for complex tasks
-2. Discover: Use `toolbelt_list_tools` to find relevant tools
-3. Execute: Work through todos, use `todo_write` with `merge=true` to update status
-4. Complete: Call `final_answer` (all todos must be completed/cancelled first)
+1. Discover: Use `toolbelt_list_tools` to find relevant tools
+2. Execute: Add only the tools you need, get the data, solve the task
+3. Complete: Call `final_answer` as soon as you have the answer
 
 ## Rules
 
+- For complex multi-step tasks, use `todo_write` to plan. For simple tasks, skip it.
 - Update todo status with `todo_write`: set `in_progress` when starting, `completed` when done
-- Show your work for calculations
+- Show your work for calculations (briefly)
 - `final_answer` is rejected if todos are incomplete
 """
     initial_messages = [

@@ -63,6 +63,7 @@ class ReActAgent:
         self.tool_call_timeout: int = 60
         self.llm_response_timeout: int = 600
         self.max_toolbelt_size: int = 80
+        self.max_total_tokens: int | None = config.get("max_total_tokens", None)
 
         self.extra_args: dict[str, Any] = run_input.orchestrator_extra_args or {}
 
@@ -76,6 +77,7 @@ class ReActAgent:
 
         # Agent state
         self._finalized: bool = False
+        self._budget_exhausted: bool = False
         self._final_answer: str | None = None
         self._final_status: str = "completed"
         self.status: AgentStatus = AgentStatus.PENDING
@@ -109,8 +111,8 @@ class ReActAgent:
 
     async def step(self, client: Any) -> None:
         """Execute one step of the ReAct loop."""
-        # Proactive ReSum check
-        if self.resum.should_summarize(self.messages):
+        # Proactive ReSum check (skip if budget exhausted to save tokens)
+        if not self._budget_exhausted and self.resum.should_summarize(self.messages):
             logger.bind(message_type="resum").info("Summarizing context")
             try:
                 self.messages = await self.resum.summarize(self.messages)
@@ -211,30 +213,31 @@ class ReActAgent:
 
             # Final answer - validate todos, then handle and return
             if name == "final_answer":
-                # Check for incomplete todos
+                # Check for incomplete todos (skip check if budget exhausted)
                 assert self.meta_tool_handler
-                incomplete = self.meta_tool_handler.get_incomplete_todos()
-                if incomplete:
-                    incomplete_list = ", ".join(
-                        f"'{t.id}' ({t.status.value})" for t in incomplete
-                    )
-                    error_msg = (
-                        f"ERROR: Cannot submit final_answer with incomplete todos. "
-                        f"You have {len(incomplete)} incomplete task(s): {incomplete_list}. "
-                        f"Use todo_write to mark each as 'completed' or 'cancelled' first."
-                    )
-                    logger.bind(message_type="tool").warning(
-                        f"final_answer rejected: {len(incomplete)} incomplete todos"
-                    )
-                    self.messages.append(
-                        LitellmOutputMessage(
-                            role="tool",
-                            tool_call_id=tool_call.id,
-                            name="final_answer",
-                            content=error_msg,
+                if not self._budget_exhausted:
+                    incomplete = self.meta_tool_handler.get_incomplete_todos()
+                    if incomplete:
+                        incomplete_list = ", ".join(
+                            f"'{t.id}' ({t.status.value})" for t in incomplete
                         )
-                    )
-                    return
+                        error_msg = (
+                            f"ERROR: Cannot submit final_answer with incomplete todos. "
+                            f"You have {len(incomplete)} incomplete task(s): {incomplete_list}. "
+                            f"Use todo_write to mark each as 'completed' or 'cancelled' first."
+                        )
+                        logger.bind(message_type="tool").warning(
+                            f"final_answer rejected: {len(incomplete)} incomplete todos"
+                        )
+                        self.messages.append(
+                            LitellmOutputMessage(
+                                role="tool",
+                                tool_call_id=tool_call.id,
+                                name="final_answer",
+                                content=error_msg,
+                            )
+                        )
+                        return
 
                 answer, status = parse_final_answer(tool_call.function.arguments)
                 logger.bind(message_type="final_answer").info(answer)
@@ -406,12 +409,56 @@ class ReActAgent:
                     self.start_time = time.time()
                     self.status = AgentStatus.RUNNING
 
+                    budget_warned = False
                     for step in range(self.max_steps):
                         if self._finalized:
                             logger.info(f"Finalized after {step} steps")
                             break
+                        if self.max_total_tokens is not None:
+                            used = self._usage_tracker.to_dict()["total_tokens"]
+                            if used >= self.max_total_tokens:
+                                logger.warning(
+                                    f"Token budget exhausted: {used}/{self.max_total_tokens}"
+                                )
+                                self._budget_exhausted = True
+                                break
+                            if (
+                                not budget_warned
+                                and used >= self.max_total_tokens * 0.75
+                            ):
+                                budget_warned = True
+                                logger.warning(
+                                    f"Token budget at 75%: {used}/{self.max_total_tokens}"
+                                )
+                                self.messages.append(
+                                    LitellmOutputMessage(
+                                        role="user",
+                                        content=(
+                                            f"WARNING: You have used {used} of {self.max_total_tokens} tokens (75% of budget). "
+                                            "Start wrapping up. Submit your final_answer soon with the best answer you have."
+                                        ),
+                                    )
+                                )
                         logger.bind(message_type="step").info(
                             f"Starting step {step + 1}"
+                        )
+                        await self.step(client)
+
+                    # Give agent one last chance to submit final_answer
+                    if self._budget_exhausted and not self._finalized:
+                        logger.info(
+                            "Budget exhausted — forcing final answer step"
+                        )
+                        self.messages.append(
+                            LitellmOutputMessage(
+                                role="user",
+                                content=(
+                                    "TOKEN BUDGET EXHAUSTED. You MUST call final_answer NOW "
+                                    "with your best answer based on the work done so far. "
+                                    "Do NOT call any other tools. Submit whatever answer "
+                                    "you have, even if incomplete."
+                                ),
+                            )
                         )
                         await self.step(client)
 
