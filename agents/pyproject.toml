@@ -27,6 +27,7 @@ dependencies = [
     "modal>=1.0.0",
     "pydantic-settings>=2.11.0",
     "redis>=6.4.0",
+    "tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git",
     "trafilatura>=1.12.0",
 ]
 
