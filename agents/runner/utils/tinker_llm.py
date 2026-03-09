@@ -32,6 +32,7 @@ import httpx
 import tinker
 from tinker.types import SamplingParams
 import litellm
+from litellm.exceptions import ContextWindowExceededError
 from litellm.llms.custom_llm import CustomLLM
 from litellm.types.utils import Choices, Message, ModelResponse, Usage
 from tinker_cookbook.renderers import Message as TinkerMessage
@@ -122,11 +123,16 @@ class TinkerCookbookLLM(CustomLLM):
             sampling_params.top_k = optional_params["top_k"]
 
         # Call Tinker sampling API
-        result = await sampling_client.sample_async(
-            prompt=model_input,
-            num_samples=1,
-            sampling_params=sampling_params,
-        )
+        try:
+            result = await sampling_client.sample_async(
+                prompt=model_input,
+                num_samples=1,
+                sampling_params=sampling_params,
+            )
+        except tinker.BadRequestError as e:
+            if "context window" in str(e).lower():
+                raise ContextWindowExceededError(str(e), model=model, llm_provider="tinker") from e
+            raise
 
         output_tokens: list[int] = result.sequences[0].tokens
 
