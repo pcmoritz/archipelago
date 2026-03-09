@@ -21,11 +21,16 @@ from runner.agents.models import LitellmAnyMessage
 from runner.utils.decorators import with_retry
 from runner.utils.settings import get_settings
 
+from runner.utils.tinker_llm import register_tinker_provider
+
 settings = get_settings()
 
 # Configure LiteLLM proxy routing if configured
 if settings.LITELLM_PROXY_API_BASE and settings.LITELLM_PROXY_API_KEY:
     litellm.use_litellm_proxy = True
+
+# Register tinker-cookbook custom provider
+register_tinker_provider()
 
 
 def _is_context_window_error(e: Exception) -> bool:
