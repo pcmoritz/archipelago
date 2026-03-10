@@ -106,21 +106,27 @@ class TinkerCookbookLLM(CustomLLM):
         renderer = _get_renderer(base_model, "kimi_k25")
         sampling_client = _get_sampling_client(base_model)
 
-        # Render messages → token IDs
+        # Convert messages to tinker format
         tinker_msgs = _to_tinker_messages(messages)
+
+        # Inject tool declarations into the prompt
+        tools = optional_params.get("tools")
+        if tools:
+            tool_specs = [t["function"] for t in tools if "function" in t]
+            match tinker_msgs:
+                case [{"role": "system", "content": system_prompt}, *rest]:
+                    pass
+                case rest:
+                    system_prompt = ""
+            tinker_msgs = renderer.create_conversation_prefix_with_tools(tool_specs, system_prompt) + rest
+
         model_input = renderer.build_generation_prompt(tinker_msgs)
         input_tokens: list[int] = model_input.to_ints()
 
         # Build sampling params from optional_params
         sampling_params = SamplingParams(
-            max_tokens=optional_params.get("max_tokens", 8192),
+            **{k: v for k, v in optional_params.items() if k in SamplingParams.model_fields}
         )
-        if "temperature" in optional_params:
-            sampling_params.temperature = optional_params["temperature"]
-        if "top_p" in optional_params:
-            sampling_params.top_p = optional_params["top_p"]
-        if "top_k" in optional_params:
-            sampling_params.top_k = optional_params["top_k"]
 
         # Call Tinker sampling API
         try:
