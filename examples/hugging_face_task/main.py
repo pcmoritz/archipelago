@@ -21,7 +21,6 @@ import zipfile
 from pathlib import Path
 
 import httpx
-from huggingface_hub import hf_hub_download
 
 EXAMPLE_DIR = Path(os.environ.get("EXAMPLE_DIR", Path(__file__).parent))
 ARCHIPELAGO_DIR = Path(os.environ.get("ARCHIPELAGO_DIR", EXAMPLE_DIR.parent.parent))
@@ -29,8 +28,7 @@ AGENTS_DIR = Path(os.environ.get("AGENTS_DIR", ARCHIPELAGO_DIR / "agents"))
 GRADING_DIR = Path(os.environ.get("GRADING_DIR", ARCHIPELAGO_DIR / "grading"))
 
 DOCKER_IMAGES_DIR = Path(os.environ.get("DOCKER_IMAGES_DIR", "/home/ubuntu/docker"))
-
-HF_DATASET = "mercor/apex-agents"
+LOCAL_DATA_DIR = Path(os.environ.get("LOCAL_DATA_DIR", "/mnt/nvme/data"))
 
 DEFAULT_TASK_SLUG = "world221-tr-01-9ba58a61"
 
@@ -241,26 +239,26 @@ def main():
     log("Capturing initial snapshot...")
     initial_zip = snapshot(env_url, output_dir / "initial_snapshot.tar.gz")
 
-    # Download task data from HuggingFace (for prompt and rubric)
-    log("Downloading task data from HuggingFace...")
-    tasks_path = hf_hub_download(
-        HF_DATASET, "tasks_and_rubrics.json", repo_type="dataset"
-    )
-    with open(tasks_path) as f:
-        hf_tasks = json.load(f)
-
-    # Map task slug suffix to HF task_id
+    # Load task data from local files
+    log("Loading task data from local files...")
     slug_suffix = task_slug.split("-")[-1]
-    task = next(
-        (t for t in hf_tasks if t["task_id"].split("_")[-1].startswith(slug_suffix)),
-        None,
-    )
-    if not task:
-        log(f"ERROR: Could not find HF task matching slug suffix '{slug_suffix}'")
+    task_dir = None
+    for entry in sorted(LOCAL_DATA_DIR.joinpath("tasks").iterdir()):
+        if not entry.is_dir():
+            continue
+        # Directory names contain task_id in parens, e.g. "name--(task_bb48b8b3...)"
+        m = re.search(r"\(task_([0-9a-f]+)\)", entry.name)
+        if m and m.group(1).startswith(slug_suffix):
+            task_dir = entry
+            break
+    if not task_dir:
+        log(f"ERROR: Could not find local task matching slug suffix '{slug_suffix}'")
         sys.exit(1)
-    log(f"HF Task: {task['task_name']}")
+    with open(task_dir / "task.json") as f:
+        task = json.load(f)
+    log(f"Task: {task['task_name']}")
 
-    # Generate initial messages from HuggingFace task prompt
+    # Generate initial messages from local task prompt
     # System prompt from agents/runner/agents/react_toolbelt_agent/README.md
     system_prompt = """You are an AI assistant that completes tasks by reasoning and using tools.
 
@@ -298,7 +296,9 @@ You have a LIMITED token budget. Conserve tokens at every step:
 """
     initial_messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task["prompt"]},
+    ] + [
+        {"role": m["role"], "content": m["content"]}
+        for m in task["task_prompt_messages"]
     ]
     with open(output_dir / "initial_messages.json", "w") as f:
         json.dump(initial_messages, f, indent=2)
@@ -362,22 +362,22 @@ You have a LIMITED token budget. Conserve tokens at every step:
     else:
         log("Running grading...")
 
-        # Generate verifiers from HuggingFace rubric
+        # Generate verifiers from local task data
         verifiers = [
             {
-                "verifier_id": c["verifier_id"],
-                "verifier_version": 1,
+                "verifier_id": v["verifier_id"],
+                "verifier_version": v.get("verifier_version", 1),
                 "world_id": task["world_id"],
                 "task_id": task["task_id"],
-                "eval_config_id": "ec_output_llm",
+                "eval_config_id": f"ec_{v['config_id']}",
                 "verifier_values": {
-                    "criteria": c["criteria"],
+                    "criteria": v["config_input"]["criteria"],
                     "is_primary_objective": i == 0,
                 },
-                "verifier_index": i,
-                "verifier_dependencies": None,
+                "verifier_index": v.get("verifier_index", i),
+                "verifier_dependencies": v.get("verifier_dependencies"),
             }
-            for i, c in enumerate(task.get("rubric", []))
+            for i, v in enumerate(task.get("task_verifiers", []))
         ]
         with open(output_dir / "verifiers.json", "w") as f:
             json.dump(verifiers, f, indent=2)
