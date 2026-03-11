@@ -12,6 +12,8 @@ class UsageTracker:
         self.prompt_tokens: int = 0
         self.completion_tokens: int = 0
         self.final_answer_tokens: int = 0
+        self.last_prompt_tokens: int = 0
+        self.last_completion_tokens: int = 0
 
     def track(self, response: ModelResponse) -> None:
         """Extract and accumulate usage from a ModelResponse."""
@@ -19,9 +21,11 @@ class UsageTracker:
         if usage is None:
             return
 
-        self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
-        self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
-        self.final_answer_tokens = getattr(usage, "completion_tokens", 0) or 0
+        self.last_prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        self.last_completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        self.prompt_tokens += self.last_prompt_tokens
+        self.completion_tokens += self.last_completion_tokens
+        self.final_answer_tokens = self.last_completion_tokens
 
     def track_from_dict(self, response_dict: dict[str, Any]) -> None:
         """Extract and accumulate usage from a response dictionary (e.g., Responses API).
@@ -37,6 +41,8 @@ class UsageTracker:
             usage.get("completion_tokens") or usage.get("output_tokens") or 0
         )
 
+        self.last_prompt_tokens = prompt_tokens
+        self.last_completion_tokens = completion_tokens
         self.prompt_tokens += prompt_tokens
         self.completion_tokens += completion_tokens
         self.final_answer_tokens = completion_tokens

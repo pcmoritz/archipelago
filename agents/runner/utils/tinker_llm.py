@@ -31,7 +31,7 @@ from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook.renderers.base import ToolCall
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
-MAX_TOTAL_TOKENS = 131072
+MAX_TOTAL_TOKENS = 65536
 
 
 @lru_cache(maxsize=4)

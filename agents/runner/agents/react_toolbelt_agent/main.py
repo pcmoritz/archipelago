@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 from fastmcp import Client as FastMCPClient
-from litellm import Choices
+from litellm import Choices, token_counter
 from litellm.exceptions import ContextWindowExceededError, Timeout
 from litellm.experimental_mcp_client import call_openai_tool, load_mcp_tools
 from litellm.files.main import ModelResponse
@@ -66,6 +66,7 @@ class ReActAgent:
         self.max_total_tokens: int | None = config.get("max_total_tokens", None)
 
         self.extra_args: dict[str, Any] = run_input.orchestrator_extra_args or {}
+        self.enable_resum: bool = config.get("enable_resum", True)
 
         # Components
         self.resum: ReSumManager = ReSumManager(self.model, self.extra_args)
@@ -111,8 +112,8 @@ class ReActAgent:
 
     async def step(self, client: Any) -> None:
         """Execute one step of the ReAct loop."""
-        # Proactive ReSum check (skip if budget exhausted to save tokens)
-        if not self._budget_exhausted and self.resum.should_summarize(self.messages):
+        # Proactive ReSum check (skip if budget exhausted or disabled)
+        if self.enable_resum and not self._budget_exhausted and self.resum.should_summarize(self.messages):
             logger.bind(message_type="resum").info("Summarizing context")
             try:
                 self.messages = await self.resum.summarize(self.messages)
@@ -130,9 +131,13 @@ class ReActAgent:
                 trajectory_id=self.trajectory_id,
             )
         except ContextWindowExceededError:
-            logger.warning("Context exceeded, summarizing")
-            self.messages = await self.resum.summarize(self.messages)
-            return
+            if self.enable_resum:
+                logger.warning("Context exceeded, summarizing")
+                self.messages = await self.resum.summarize(self.messages)
+                return
+            else:
+                logger.error("Context exceeded and resum is disabled")
+                raise
         except Timeout:
             logger.error("LLM timeout")
             return
@@ -415,26 +420,29 @@ class ReActAgent:
                             logger.info(f"Finalized after {step} steps")
                             break
                         if self.max_total_tokens is not None:
-                            used = self._usage_tracker.to_dict()["total_tokens"]
-                            if used >= self.max_total_tokens:
+                            trajectory_tokens = (
+                                self._usage_tracker.last_prompt_tokens
+                                + self._usage_tracker.last_completion_tokens
+                            )
+                            if trajectory_tokens >= self.max_total_tokens:
                                 logger.warning(
-                                    f"Token budget exhausted: {used}/{self.max_total_tokens}"
+                                    f"Token budget exhausted: {trajectory_tokens}/{self.max_total_tokens}"
                                 )
                                 self._budget_exhausted = True
                                 break
                             if (
                                 not budget_warned
-                                and used >= self.max_total_tokens * 0.75
+                                and trajectory_tokens >= self.max_total_tokens * 0.75
                             ):
                                 budget_warned = True
                                 logger.warning(
-                                    f"Token budget at 75%: {used}/{self.max_total_tokens}"
+                                    f"Token budget at 75%: {trajectory_tokens}/{self.max_total_tokens}"
                                 )
                                 self.messages.append(
                                     LitellmOutputMessage(
                                         role="user",
                                         content=(
-                                            f"WARNING: You have used {used} of {self.max_total_tokens} tokens (75% of budget). "
+                                            f"WARNING: Your trajectory is {trajectory_tokens} of {self.max_total_tokens} tokens (75% of budget). "
                                             "Start wrapping up. Submit your final_answer soon with the best answer you have."
                                         ),
                                     )

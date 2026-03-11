@@ -282,10 +282,13 @@ class LoopAgent:
                             logger.info(f"Agent loop was finalized after {i + 1} steps")
                             break
                         if self.max_total_tokens is not None:
-                            used = self._usage_tracker.to_dict()["total_tokens"]
-                            if used >= self.max_total_tokens:
+                            trajectory_tokens = (
+                                self._usage_tracker.last_prompt_tokens
+                                + self._usage_tracker.last_completion_tokens
+                            )
+                            if trajectory_tokens >= self.max_total_tokens:
                                 logger.warning(
-                                    f"Token budget exhausted: {used}/{self.max_total_tokens}"
+                                    f"Token budget exhausted: {trajectory_tokens}/{self.max_total_tokens}"
                                 )
                                 budget_exhausted = True
                                 break

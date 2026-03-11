@@ -4,6 +4,7 @@
   "agent_config_values": {
     "timeout": 3600,
     "max_steps": 50,
-    "max_total_tokens": 131072
+    "max_total_tokens": 65536,
+    "enable_resum": false
   }
 }

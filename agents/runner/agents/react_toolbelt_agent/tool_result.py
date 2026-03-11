@@ -12,10 +12,9 @@ from loguru import logger
 from runner.agents.models import LitellmInputMessage
 
 # Defaults for head_tail truncation
-# With ReSum context summarization, we can afford larger results
-MAX_RESULT_TOKENS = 24000  # ~24k tokens before truncation
-HEAD_CHARS = 20000  # Keep first 20k chars
-TAIL_CHARS = 5000  # Keep last 5k chars
+MAX_RESULT_TOKENS = 8000  # ~8k tokens before truncation
+HEAD_CHARS = 6000  # Keep first 6k chars
+TAIL_CHARS = 2000  # Keep last 2k chars
 
 # Absolute maximum - if result exceeds this even after truncation, return error
 # This prevents absurdly large results from ever being added to context
