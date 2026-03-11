@@ -1,44 +1,37 @@
 """
 Custom LiteLLM provider that uses tinker-cookbook to render chat messages into
-tokens via a kimi_k25 renderer, sends them to the Tinker sampling API, and
-parses the token-level response back.
+tokens (to measure prompt length), then forwards the request to OpenRouter
+via litellm, constraining max_tokens based on the rendered token count.
 
-Raw input/output token IDs are stored in provider_specific_fields for training.
-
-Requires TINKER_API_KEY env var for the Tinker service.
+Requires OPENROUTER_API_KEY env var.
 
 Usage:
     from runner.utils.tinker_llm import register_tinker_provider
     register_tinker_provider()
 
     response = await litellm.acompletion(
-        model="tinker/openrouter/moonshotai/kimi-k2.5",
+        model="tinker/moonshotai/Kimi-K2.5",
         messages=[{"role": "user", "content": "Hello"}],
         base_model="moonshotai/Kimi-K2.5",
     )
-    pf = response.choices[0].message.provider_specific_fields
-    pf["input_tokens"]   # list[int] - rendered prompt token IDs
-    pf["output_tokens"]  # list[int] - completion token IDs
 """
 
 from __future__ import annotations
 
-import time
-import uuid
 from functools import lru_cache
 from typing import Any, Callable, Optional, Union
 
 import httpx
-import tinker
-from tinker.types import SamplingParams
 import litellm
 from litellm.exceptions import ContextWindowExceededError
 from litellm.llms.custom_llm import CustomLLM
-from litellm.types.utils import Choices, Message, ModelResponse, Usage
+from litellm.types.utils import ModelResponse
 from tinker_cookbook.renderers import Message as TinkerMessage
 from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook.renderers.base import ToolCall
 from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+MAX_TOTAL_TOKENS = 131072
 
 
 @lru_cache(maxsize=4)
@@ -51,16 +44,6 @@ def _get_renderer(base_model: str, renderer_name: str):
     return get_renderer(renderer_name, _get_tokenizer(base_model))
 
 
-@lru_cache(maxsize=1)
-def _get_service_client() -> tinker.ServiceClient:
-    return tinker.ServiceClient()
-
-
-@lru_cache(maxsize=4)
-def _get_sampling_client(base_model: str) -> tinker.SamplingClient:
-    return _get_service_client().create_sampling_client(base_model=base_model)
-
-
 def _to_tinker_messages(messages: list[dict[str, Any]]) -> list[TinkerMessage]:
     """Convert litellm message dicts to tinker-cookbook Messages."""
     out: list[TinkerMessage] = []
@@ -71,15 +54,17 @@ def _to_tinker_messages(messages: list[dict[str, Any]]) -> list[TinkerMessage]:
         if "tool_call_id" in msg:
             tinker_msg["tool_call_id"] = msg["tool_call_id"]
         if "tool_calls" in msg:
+            allowed = set(ToolCall.model_fields)
             tinker_msg["tool_calls"] = [
-                ToolCall.model_validate(tc) for tc in msg["tool_calls"]
+                ToolCall.model_validate({k: v for k, v in tc.items() if k in allowed})
+                for tc in msg["tool_calls"]
             ]
         out.append(tinker_msg)
     return out
 
 
 class TinkerCookbookLLM(CustomLLM):
-    """Renders messages to tokens, calls Tinker sampling API, parses response back."""
+    """Renders messages to tokens to measure prompt length, then delegates to OpenRouter via litellm."""
 
     async def acompletion(
         self,
@@ -100,13 +85,11 @@ class TinkerCookbookLLM(CustomLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client=None,
     ) -> ModelResponse:
-        # base_model is a known litellm kwarg routed to litellm_params
         base_model: str = litellm_params["base_model"]
 
         renderer = _get_renderer(base_model, "kimi_k25")
-        sampling_client = _get_sampling_client(base_model)
 
-        # Convert messages to tinker format
+        # Convert messages to tinker format to measure token count
         tinker_msgs = _to_tinker_messages(messages)
 
         # Inject tool declarations into the prompt
@@ -121,67 +104,30 @@ class TinkerCookbookLLM(CustomLLM):
             tinker_msgs = renderer.create_conversation_prefix_with_tools(tool_specs, system_prompt) + rest
 
         model_input = renderer.build_generation_prompt(tinker_msgs)
-        input_tokens: list[int] = model_input.to_ints()
+        input_token_count = len(model_input.to_ints())
 
-        # Build sampling params from optional_params
-        sampling_params = SamplingParams(
-            **{k: v for k, v in optional_params.items() if k in SamplingParams.model_fields}
-        )
-
-        # Call Tinker sampling API
-        try:
-            result = await sampling_client.sample_async(
-                prompt=model_input,
-                num_samples=1,
-                sampling_params=sampling_params,
+        # Constrain max_tokens so input + output <= MAX_TOTAL_TOKENS
+        max_output_tokens = MAX_TOTAL_TOKENS - input_token_count
+        if max_output_tokens <= 0:
+            raise ContextWindowExceededError(
+                f"Input tokens ({input_token_count}) exceed MAX_TOTAL_TOKENS ({MAX_TOTAL_TOKENS})",
+                model=model,
+                llm_provider="openrouter",
             )
-        except tinker.BadRequestError as e:
-            if "context window" in str(e).lower():
-                raise ContextWindowExceededError(str(e), model=model, llm_provider="tinker") from e
-            raise
+        optional_params["max_tokens"] = max_output_tokens
 
-        output_tokens: list[int] = result.sequences[0].tokens
+        # Forward to OpenRouter via litellm
+        # model comes in as the part after "tinker/", e.g. "moonshotai/Kimi-K2.5"
+        openrouter_model = f"openrouter/{model}"
 
-        # Parse response through renderer
-        parsed_msg, parse_success = renderer.parse_response(output_tokens)
-        content = parsed_msg["content"]
-        # Renderer may return content as a list of blocks; extract text only
-        if isinstance(content, list):
-            content = "".join(b["text"] for b in content if b["type"] == "text")
-        tool_calls = parsed_msg.get("tool_calls")
-        if tool_calls:
-            tool_calls = [tc.model_dump() for tc in tool_calls]
-
-        finish_reason = (
-            "tool_calls" if tool_calls
-            else "stop" if parse_success
-            else "length"
+        response = await litellm.acompletion(
+            model=openrouter_model,
+            messages=messages,
+            timeout=timeout,
+            **optional_params,
         )
 
-        model_response.id = f"chatcmpl-tinker-{uuid.uuid4().hex[:12]}"
-        model_response.created = int(time.time())
-        model_response.model = model
-        model_response.choices = [
-            Choices(
-                finish_reason=finish_reason,
-                index=0,
-                message=Message(
-                    content=content or None,
-                    role="assistant",
-                    tool_calls=tool_calls,
-                    provider_specific_fields={
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                    },
-                ),
-            )
-        ]
-        model_response.usage = Usage(
-            prompt_tokens=len(input_tokens),
-            completion_tokens=len(output_tokens),
-            total_tokens=len(input_tokens) + len(output_tokens),
-        )
-        return model_response
+        return response
 
 
 tinker_llm_instance = TinkerCookbookLLM()
