@@ -21,6 +21,9 @@ DOCKER_DIR = Path(os.environ.get("DOCKER_IMAGES_DIR", "/mnt/nvme/images/docker/"
 SCRIPT_DIR = Path(__file__).parent
 OUTPUT_DIR = SCRIPT_DIR / "output"
 
+# Worlds to skip (e.g. world208 agents get OOM-killed)
+SKIP_WORLDS = {"world-208", "world_90086069a0514af3941871d4d6f071d2"}
+
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -29,6 +32,8 @@ def log(msg):
 def discover_tasks():
     tasks = []
     for world_dir in sorted(DOCKER_DIR.iterdir()):
+        if any(s in world_dir.name for s in SKIP_WORLDS):
+            continue
         tasks_dir = world_dir / "tasks"
         if not tasks_dir.is_dir():
             continue

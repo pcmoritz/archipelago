@@ -369,7 +369,7 @@ You have a LIMITED token budget. Conserve tokens at every step:
                 "verifier_version": v.get("verifier_version", 1),
                 "world_id": task["world_id"],
                 "task_id": task["task_id"],
-                "eval_config_id": f"ec_{v['config_id']}",
+                "eval_config_id": "ec_output_llm",
                 "verifier_values": {
                     "criteria": v["config_input"]["criteria"],
                     "is_primary_objective": i == 0,
