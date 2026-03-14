@@ -87,7 +87,7 @@ class TinkerCookbookLLM(CustomLLM):
     ) -> ModelResponse:
         base_model: str = litellm_params["base_model"]
 
-        renderer = _get_renderer(base_model, "kimi_k25")
+        renderer = _get_renderer(base_model, "qwen3_5")
 
         # Convert messages to tinker format to measure token count
         tinker_msgs = _to_tinker_messages(messages)
