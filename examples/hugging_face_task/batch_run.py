@@ -66,7 +66,7 @@ def run_task(slug, max_retries=3):
             with open(out / "run.log", "w") as lf:
                 rc = subprocess.run(
                     [sys.executable, str(SCRIPT_DIR / "main.py"), slug],
-                    env=env, stdout=lf, stderr=subprocess.STDOUT, timeout=1800,
+                    env=env, stdout=lf, stderr=subprocess.STDOUT, timeout=3600,
                 ).returncode
         except subprocess.TimeoutExpired:
             log(f"TIMEOUT {slug} (attempt {attempt}/{max_retries})")
@@ -86,7 +86,7 @@ def run_task(slug, max_retries=3):
 def main():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--workers", type=int, default=32)
+    p.add_argument("--workers", type=int, default=8)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--skip-preload", action="store_true")
     args = p.parse_args()
