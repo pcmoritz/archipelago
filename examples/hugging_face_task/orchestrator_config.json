@@ -1,7 +1,6 @@
 {
-  "model": "tinker/moonshotai/Kimi-K2.5",
+  "model": "tinker/qwen/qwen3.5-27b",
   "extra_args": {
-    "base_model": "moonshotai/Kimi-K2.5",
-    "top_p": 0.95
+    "base_model": "qwen/qwen3.5-27b"
   }
 }
