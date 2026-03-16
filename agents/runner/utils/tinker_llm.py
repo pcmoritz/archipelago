@@ -87,7 +87,7 @@ class TinkerCookbookLLM(CustomLLM):
     ) -> ModelResponse:
         base_model: str = litellm_params["base_model"]
 
-        renderer = _get_renderer(base_model, "kimi_k25")
+        renderer = _get_renderer(base_model, "qwen3_5")
 
         # Convert messages to tinker format to measure token count
         tinker_msgs = _to_tinker_messages(messages)
@@ -116,16 +116,29 @@ class TinkerCookbookLLM(CustomLLM):
             )
         optional_params["max_tokens"] = max_output_tokens
 
-        # Forward to OpenRouter via litellm
-        # model comes in as the part after "tinker/", e.g. "moonshotai/Kimi-K2.5"
-        openrouter_model = f"openrouter/{model}"
-
-        response = await litellm.acompletion(
-            model=openrouter_model,
-            messages=messages,
-            timeout=timeout,
-            **optional_params,
-        )
+        # Forward the request via litellm
+        # If api_base is provided, use it directly with openai/ prefix;
+        # otherwise fall back to OpenRouter.
+        extra_headers = optional_params.pop("extra_headers", None) or headers
+        if api_base:
+            target_model = f"openai/{model}"
+            response = await litellm.acompletion(
+                model=target_model,
+                messages=messages,
+                timeout=timeout,
+                api_base=api_base,
+                api_key="unused",
+                extra_headers=extra_headers,
+                **optional_params,
+            )
+        else:
+            openrouter_model = f"openrouter/{model}"
+            response = await litellm.acompletion(
+                model=openrouter_model,
+                messages=messages,
+                timeout=timeout,
+                **optional_params,
+            )
 
         return response
 
