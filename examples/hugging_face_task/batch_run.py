@@ -45,12 +45,34 @@ def discover_tasks():
 
 def preload_images():
     log("Pre-loading Docker images...")
+    failed = []
     for world_dir in sorted(DOCKER_DIR.iterdir()):
         tar = world_dir / "image.tar"
         if not tar.exists():
             continue
-        log(f"  {world_dir.name}")
-        subprocess.run(["docker", "load", "-i", str(tar)], capture_output=True)
+        # Check if image is already loaded by reading the tag from the manifest
+        try:
+            import tarfile as _tarfile
+            with _tarfile.open(str(tar), "r") as tf:
+                manifest = json.loads(tf.extractfile("manifest.json").read())
+            tags = manifest[0].get("RepoTags", [])
+            if tags:
+                result = subprocess.run(
+                    ["docker", "image", "inspect", tags[0]],
+                    capture_output=True,
+                )
+                if result.returncode == 0:
+                    log(f"  {world_dir.name} (already loaded)")
+                    continue
+        except Exception:
+            pass
+        log(f"  {world_dir.name} (loading...)")
+        result = subprocess.run(["docker", "load", "-i", str(tar)], capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"    ERROR: docker load failed: {result.stderr.strip()}")
+            failed.append(world_dir.name)
+    if failed:
+        log(f"WARNING: {len(failed)} images failed to load: {failed}")
     log("Done loading images.")
 
 
